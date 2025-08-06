@@ -1,0 +1,171 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+#############
+# Dont forget to replace placeholders before booting (!):
+# - YOUR.DOMAIN.TLD
+# - YOUR-MAIL@DOMAIN.TLD
+#############
+
+runcmd:
+  - apt-get install -y net-tools
+  
+  # Install Docker and Docker Compose plugin
+  - curl -fsSL https://get.docker.com -o get-docker.sh
+  - sh get-docker.sh
+  - usermod -aG docker ubuntu
+  - apt-get install -y docker-compose-plugin
+
+  # Create project directories
+  - mkdir -p /opt/reverse-proxy/app
+
+  # Create Docker Compose file
+  - |
+    cat > /opt/reverse-proxy/docker-compose.yml << 'EOF'
+    version: "3.8"
+
+    services:
+      app:
+        build: ./app
+        container_name: dynamic-proxy-app
+        restart: always
+        expose:
+          - "3000"
+        networks:
+          - proxy-net
+
+      caddy:
+        image: caddy:2
+        container_name: caddy
+        restart: always
+        ports:
+          - "80:80"
+          - "443:443"
+        volumes:
+          - ./Caddyfile:/etc/caddy/Caddyfile
+          - caddy_data:/data
+          - caddy_config:/config
+        depends_on:
+          - app
+        networks:
+          - proxy-net
+
+    networks:
+      proxy-net:
+
+    volumes:
+      caddy_data:
+      caddy_config:
+    EOF
+
+  # Create Caddyfile
+  - |
+    cat > /opt/reverse-proxy/Caddyfile << EOF
+    YOUR.DOMAIN.TLD {
+        reverse_proxy app:3000 {
+          header_down Access-Control-Allow-Origin  *
+          header_down Access-Control-Allow-Methods "GET, OPTIONS"
+          header_down Access-Control-Allow-Headers "Content-Type"
+        }
+        encode gzip
+        tls YOUR-MAIL@DOMAIN.TLD
+    }
+    EOF
+
+  # Create Node.js app files
+  - |
+    cat > /opt/reverse-proxy/app/package.json << 'EOF'
+    {
+      "name": "dynamic-reverse-proxy",
+      "version": "1.0.0",
+      "main": "proxy.js",
+      "type": "module",
+      "dependencies": {
+        "express": "^4.19.2",
+        "http-proxy-middleware": "^2.0.6"
+      }
+    }
+    EOF
+
+  - |
+    cat > /opt/reverse-proxy/app/proxy.js << 'EOF'
+    import express from "express";
+    import { createProxyMiddleware } from "http-proxy-middleware";
+    import { EventEmitter } from "events";
+
+    // Prevent MaxListenersExceededWarning
+    EventEmitter.defaultMaxListeners = 1000;
+
+    const app = express();
+
+    const allowedPaths = [
+      "/api/node",
+      "/api/network/statistics",
+      "/api/ledger/statistics"
+    ];
+
+    // Proxy cache per target IP
+    const proxyCache = new Map();
+
+    function getProxyForTarget(target) {
+      if (!proxyCache.has(target)) {
+        const proxy = createProxyMiddleware({
+          target,
+          changeOrigin: false,
+          pathRewrite: (path) => path,
+        });
+        proxyCache.set(target, proxy);
+      }
+      return proxyCache.get(target);
+    }
+
+    // Path and IP validation, then proxy
+    app.use(allowedPaths, (req, res, next) => {
+      const target = req.query.target;
+      const path = new URL(req.originalUrl, `http://${req.headers.host}`).pathname;
+
+      if (!allowedPaths.includes(path)) {
+        return res.status(403).send("Forbidden path");
+      }
+
+      if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(target)) {
+        return res.status(400).send("Invalid IP format");
+      }
+
+      const upstreamTarget = `http://${target}:8080`;
+      return getProxyForTarget(upstreamTarget)(req, res, next);
+    });
+
+    const port = 3000;
+    app.listen(port, () => {
+      console.log(`Reverse proxy running on port ${port}`);
+    });
+    EOF
+
+  - |
+    cat > /opt/reverse-proxy/app/Dockerfile << 'EOF'
+    FROM node:20-alpine
+
+    WORKDIR /app
+
+    COPY package.json ./
+    RUN npm install
+
+    COPY proxy.js ./
+
+    CMD ["node", "proxy.js"]
+    EOF
+
+  # Initialize project (clean rebuild)
+  - cd /opt/reverse-proxy && docker compose up -d --build
+
+final_message: "Reverse proxy with Caddy and dynamic IP forwarding for Radix Hyperscale nodes deployed."
+
+
+#############
+# Follow cloud-init log file after boot:
+# > tail -f /var/log/cloud-init-output.log
+# Verify cloud-init script:
+# > cat /var/lib/cloud/instance/scripts/runcmd
+#############
